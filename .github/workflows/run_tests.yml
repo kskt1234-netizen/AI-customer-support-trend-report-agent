@@ -1,0 +1,49 @@
+name: Agent Hub Tests
+
+# [투트랙 트리거 — 면접 어필 포인트]
+#  - push / pull_request : 평소 개발 흐름. 비용·속도를 위해 'mock' 모드로 로직만 검증.
+#  - workflow_dispatch    : 깃허브 UI에서 '수동 실행' 버튼. 'real' 모드를 골라
+#                           실제 OpenAI API로 분류 정확도를 측정할 수 있게 한다.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "테스트 모드 (mock=무료/빠름, real=실제 API 호출/정확도 측정)"
+        required: true
+        default: "mock"
+        type: choice
+        options:
+          - mock
+          - real
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    env:
+      # 수동 실행(workflow_dispatch)이면 사용자가 고른 값을, 그 외(push 등)엔 항상 mock.
+      TEST_MODE: ${{ github.event.inputs.test_mode || 'mock' }}
+      # real 모드일 때만 의미가 있다. mock 모드에선 비어 있어도 테스트가 돈다.
+      # 실제 키는 코드가 아니라 GitHub Secrets(Settings > Secrets)에 저장한다.
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+    steps:
+      - name: 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 파이썬 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 의존성 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 테스트 실행 (TEST_MODE=${{ env.TEST_MODE }})
+        run: pytest -v

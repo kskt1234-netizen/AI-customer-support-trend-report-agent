@@ -1,0 +1,8 @@
+# pytest / pytest-asyncio 설정.
+# [왜 이 파일이 필요한가?]
+# test_harness의 분류 테스트는 async 함수다. pytest-asyncio가 이를 자동으로
+# 인식하려면 asyncio_mode를 'auto'로 켜야 한다. 안 켜면 @pytest.mark.asyncio가
+# 무시되어 "coroutine was never awaited" 경고와 함께 테스트가 헛돈다.
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

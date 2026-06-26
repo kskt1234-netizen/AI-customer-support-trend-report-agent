@@ -1,0 +1,66 @@
+{
+  "description": "오케스트레이터 의도 분류 골든셋(족보). 헷갈리는 경계 케이스 위주로 구성. mock 모드에선 expected_intent를 그대로 반환하도록 매핑하고, real 모드에선 실제 LLM 분류 결과와 expected_intent를 비교해 정확도를 측정한다.",
+  "pass_threshold": 0.9,
+  "cases": [
+    {
+      "id": 1,
+      "query": "올해 우리 업계 매출 트렌드 좀 분석해줘",
+      "expected_intent": "TREND_REPORT",
+      "note": "명시적 '트렌드 분석' 요청 — 전형적 TREND_REPORT"
+    },
+    {
+      "id": 2,
+      "query": "비밀번호 어떻게 바꿔요?",
+      "expected_intent": "SIMPLE_CHAT",
+      "note": "계정/사용법 문의 — 전형적 SIMPLE_CHAT"
+    },
+    {
+      "id": 3,
+      "query": "작년 대비 올해 시장 성장률이 궁금한데 리포트로 만들어줄 수 있어?",
+      "expected_intent": "TREND_REPORT",
+      "note": "'성장률 + 리포트' 키워드. 분석 요청"
+    },
+    {
+      "id": 4,
+      "query": "환불 규정이 어떻게 되나요?",
+      "expected_intent": "SIMPLE_CHAT",
+      "note": "정책 문의 — 분석 아님"
+    },
+    {
+      "id": 5,
+      "query": "요즘 SaaS 시장 어떻게 돌아가는지 추세 좀 정리해줘",
+      "expected_intent": "TREND_REPORT",
+      "note": "'추세 정리' = 트렌드 분석의 다른 표현. 어휘 변형 함정"
+    },
+    {
+      "id": 6,
+      "query": "결제가 자꾸 실패하는데 왜 이래요?",
+      "expected_intent": "SIMPLE_CHAT",
+      "note": "기술 지원 문의 — 분석 아님"
+    },
+    {
+      "id": 7,
+      "query": "경쟁사들 매출이 요즘 어떤 흐름인지 보고서로 받아볼 수 있을까?",
+      "expected_intent": "TREND_REPORT",
+      "note": "'흐름 + 보고서' — 분석 요청. 완곡한 표현 함정"
+    },
+    {
+      "id": 8,
+      "query": "우리 회사 작년 매출이 얼마였는지 그냥 숫자만 알려줘",
+      "expected_intent": "SIMPLE_CHAT",
+      "note": "함정: '매출'이 들어가지만 '트렌드 분석'이 아니라 단순 사실 조회. 키워드 매칭의 함정을 거르는지 검증"
+    },
+    {
+      "id": 9,
+      "query": "시장 성장률이라는 게 정확히 무슨 뜻이야?",
+      "expected_intent": "SIMPLE_CHAT",
+      "note": "함정: '시장 성장률' 단어가 있지만 '분석 요청'이 아니라 '용어 정의' 질문. 의미 vs 키워드 구분 검증"
+    },
+    {
+      "id": 10,
+      "query": "다음 분기 업계 전망을 데이터 기반으로 정리한 트렌드 자료가 필요해",
+      "expected_intent": "TREND_REPORT",
+      "note": "'전망 + 데이터 기반 + 트렌드 자료' — 명백한 분석/리포트 요청"
+    }
+  ]
+}

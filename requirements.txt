@@ -1,0 +1,14 @@
+# ── 핵심 프레임워크 ──────────────────────────────────────────
+langgraph>=0.2.0          # 그래프(오케스트레이터/서브그래프, 조건부 엣지, 루프)
+langchain-core>=0.3.0     # BaseChatModel 등 공통 LLM 인터페이스(공급사 추상화의 토대)
+langchain-openai>=0.2.0   # OpenAI 구현체(ChatOpenAI, with_structured_output)
+
+# ── 데이터 계약/검증 ────────────────────────────────────────
+pydantic>=2.0             # 경계 검증용 스키마(IntentClassification, TrendReportOutput)
+
+# ── 설정/환경 ───────────────────────────────────────────────
+python-dotenv>=1.0        # .env에서 OPENAI_API_KEY 등 로드
+
+# ── 테스트/하네스 ───────────────────────────────────────────
+pytest>=8.0              # 자동 채점기 실행기
+pytest-asyncio>=0.23     # async 테스트(ainvoke로 그래프를 비동기 실행) 지원
