@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ─────────────────────────────────────────────────────────────
@@ -34,11 +34,12 @@ class IntentType(str, Enum):
     의도를 평범한 str로 두면 LLM이 "trend", "리포트", "TrendReport" 처럼
     제멋대로 변형된 값을 뱉을 수 있고, 그러면 라우팅 분기가 깨진다.
     Enum으로 허용값을 못 박으면, with_structured_output이 LLM 출력을
-    이 두 값 중 하나로 '강제'한다. → 라우팅 안정성 확보.
+    이 값들 중 하나로 '강제'한다. → 라우팅 안정성 확보.
     """
 
-    SIMPLE_CHAT = "SIMPLE_CHAT"  # 일반 고객 문의/잡담 → 그냥 답변
+    SIMPLE_CHAT = "SIMPLE_CHAT"  # 일반 고객 문의/처리 요청/잡담 → 그냥 답변
     TREND_REPORT = "TREND_REPORT"  # 시장/매출 트렌드 분석 요청 → 리포트 서브 그래프
+    POLICY_INQUIRY = "POLICY_INQUIRY"  # 회사 규정/정책/계약 조건 문의 → RAG 서브 그래프
 
 
 class IntentClassification(BaseModel):
@@ -50,7 +51,7 @@ class IntentClassification(BaseModel):
 
     intent: IntentType = Field(
         ...,  # ... = 필수(required)
-        description="유저 질문의 의도. SIMPLE_CHAT 또는 TREND_REPORT 중 하나.",
+        description="유저 질문의 의도. SIMPLE_CHAT / TREND_REPORT / POLICY_INQUIRY 중 하나.",
     )
     reasoning: str = Field(
         ...,
@@ -97,3 +98,41 @@ class TrendReportOutput(BaseModel):
         노드가 읽기 쉬워진다. 계약과 합격 기준을 모델 안에 같이 둔다.
         """
         return bool(self.sources) and isinstance(self.market_growth_rate, float)
+
+
+# ─────────────────────────────────────────────────────────────
+# 3) 규정(RAG) 답변 최종 산출물 — POLICY_INQUIRY 워커의 출력 계약
+# ─────────────────────────────────────────────────────────────
+class PolicyAnswerOutput(BaseModel):
+    """POLICY_INQUIRY(RAG) 워커의 최종 답변 계약.
+
+    [설계 핵심 — 환각 방어를 '계약'에 새긴다]
+    grounded 플래그가 이 모델의 심장이다:
+      - grounded=True  : 답변이 검색된 사내 문서에 접지(grounding)됐고,
+                         접지 검증을 통과했으며, 인용(citations)이 반드시 1개 이상이다.
+      - grounded=False : 문서 근거를 확보하지 못한 '정직한 거절/안내' 답변이다.
+                         (지어낸 답 대신 모른다고 말하는 것도 정상 산출물이다)
+    즉 "근거 있는 답" 또는 "근거 없다고 정직하게 밝힌 답"만 이 계약을 통과한다.
+    '근거 없는데 그럴듯한 답'은 아래 validator가 경계에서 차단한다.
+    """
+
+    answer: str = Field(
+        ...,
+        min_length=1,
+        description="고객에게 전달할 답변 본문.",
+    )
+    citations: list[str] = Field(
+        default_factory=list,
+        description="답변의 근거로 인용된 사내 문서 ID 목록. 거절 답변이면 비어 있을 수 있다.",
+    )
+    grounded: bool = Field(
+        ...,
+        description="답변이 검색된 문서에 접지되었는지. False면 정직한 '근거 없음' 안내.",
+    )
+
+    @model_validator(mode="after")
+    def _grounded_requires_citations(self) -> "PolicyAnswerOutput":
+        """grounded=True인데 인용이 없는 모순된 답변은 계약 위반으로 차단한다."""
+        if self.grounded and not self.citations:
+            raise ValueError("grounded=True인 답변은 최소 1개의 인용(citations)이 필요합니다.")
+        return self

@@ -38,7 +38,7 @@ class AgentState(TypedDict, total=False):
     user_query: str  # 유저의 원본 질문. 모든 흐름의 출발점.
 
     # ── 오케스트레이터(메인 그래프)가 채우는 필드 ──────────────
-    intent: str  # "SIMPLE_CHAT" 또는 "TREND_REPORT". 라우팅 기준.
+    intent: str  # "SIMPLE_CHAT" / "TREND_REPORT" / "POLICY_INQUIRY". 라우팅 기준.
 
     # ── SIMPLE_CHAT 경로의 결과 ───────────────────────────
     chat_response: str  # 단순 답변 텍스트.
@@ -52,8 +52,16 @@ class AgentState(TypedDict, total=False):
     draft_report: str  # LLM이 작성한 보고서 초안.
     critic_passed: bool  # 검수 '합격 도장'. True면 통과, False면 반려. (명시적 신호)
     critic_feedback: str  # 검수자가 초안을 반려할 때 남기는 피드백.
-    retry_count: int  # 초안↔검수 핑퐁 횟수. 무한 루프 방어용 카운터.
+    retry_count: int  # 재작성 루프 횟수. 무한 루프 방어용 카운터.
+    #   (트렌드/RAG 워커가 공유한다 — 한 요청은 워커 하나만 통과하므로 충돌 없음)
+
+    # ── POLICY_INQUIRY(RAG) 서브 그래프가 채우는 필드 ──────────
+    retrieved_docs: list[dict]  # 검색된 사내 규정 문서(RetrievedDoc.model_dump()) 목록.
+    policy_answer: str  # LLM이 문서 근거로 작성한 답변 초안.
+    grounding_passed: bool  # 접지(grounding) 검증 합격 여부. (환각 방어 게이트)
+    grounding_feedback: str  # 접지 검증 반려 사유. 재작성 프롬프트에 주입된다.
 
     # ── 최종 산출 / 예외 ─────────────────────────────────────
-    final_output: dict  # Pydantic(TrendReportOutput) 검증을 통과한 최종 결과의 dict.
-    error: str  # 저하/탈출 사유. (수집 실패, 수치 불량, LLM 호출 실패, 루프 한도 초과 등)
+    final_output: dict  # 경계 계약 검증을 통과한 최종 결과의 dict.
+    #   (트렌드 경로=TrendReportOutput, 규정 경로=PolicyAnswerOutput)
+    error: str  # 저하/탈출 사유. (수집/검색 실패, 수치 불량, LLM 호출 실패, 루프 한도 초과 등)

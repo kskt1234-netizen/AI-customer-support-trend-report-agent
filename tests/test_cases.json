@@ -1,5 +1,5 @@
 {
-  "description": "오케스트레이터 의도 분류 골든셋(족보). 헷갈리는 경계 케이스 위주로 구성. mock 모드에선 expected_intent를 그대로 반환하도록 매핑하고, real 모드에선 실제 LLM 분류 결과와 expected_intent를 비교해 정확도를 측정한다.",
+  "description": "오케스트레이터 의도 분류 골든셋(족보). 헷갈리는 경계 케이스 위주로 구성. mock 모드에선 expected_intent를 그대로 반환하도록 매핑하고, real 모드에선 실제 LLM 분류 결과와 expected_intent를 비교해 정확도를 측정한다. POLICY_INQUIRY 도입(2026-07)으로 규정 문의 케이스가 재라벨링됨 — '규정이 무엇인지 묻기'=POLICY_INQUIRY, '처리 요청'=SIMPLE_CHAT.",
   "pass_threshold": 0.9,
   "cases": [
     {
@@ -23,8 +23,8 @@
     {
       "id": 4,
       "query": "환불 규정이 어떻게 되나요?",
-      "expected_intent": "SIMPLE_CHAT",
-      "note": "정책 문의 — 분석 아님"
+      "expected_intent": "POLICY_INQUIRY",
+      "note": "규정이 '무엇인지' 묻는 정책 문의 — POLICY_INQUIRY 도입으로 SIMPLE_CHAT에서 재라벨링됨"
     },
     {
       "id": 5,
@@ -61,6 +61,30 @@
       "query": "다음 분기 업계 전망을 데이터 기반으로 정리한 트렌드 자료가 필요해",
       "expected_intent": "TREND_REPORT",
       "note": "'전망 + 데이터 기반 + 트렌드 자료' — 명백한 분석/리포트 요청"
+    },
+    {
+      "id": 11,
+      "query": "환불 위약금이 몇 퍼센트인지 규정 기준으로 알려주세요",
+      "expected_intent": "POLICY_INQUIRY",
+      "note": "규정 수치 문의 — 전형적 POLICY_INQUIRY"
+    },
+    {
+      "id": 12,
+      "query": "계약 자동 갱신을 막으려면 언제까지 통지해야 하나요?",
+      "expected_intent": "POLICY_INQUIRY",
+      "note": "계약 조건 문의 — '규정/조건이 무엇인지'를 묻는다"
+    },
+    {
+      "id": 13,
+      "query": "서비스 해지하면 우리 회사 데이터는 언제까지 보관되나요?",
+      "expected_intent": "POLICY_INQUIRY",
+      "note": "데이터 보관 정책 문의 — 사내 문서 근거가 필요한 질문"
+    },
+    {
+      "id": 14,
+      "query": "결제를 잘못했는데 환불 처리 좀 해주세요",
+      "expected_intent": "SIMPLE_CHAT",
+      "note": "함정: '환불' 키워드가 있지만 규정 문의가 아니라 '처리 요청'. 의도 vs 키워드 구분 검증"
     }
   ]
 }

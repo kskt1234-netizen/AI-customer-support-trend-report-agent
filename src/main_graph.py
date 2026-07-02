@@ -16,13 +16,14 @@ main_graph.py — 마스터(오케스트레이터) 그래프.
           │
           ▼
    ◇ route_by_intent ◇   ← '조건부 엣지'. State.intent 값을 읽어 분기.
-        ╱        ╲
-       ╱          ╲
- SIMPLE_CHAT   TREND_REPORT
-   노드            노드(서브 그래프)
-       ╲          ╱
-        ╲        ╱
-          ▼    ▼
+      ╱      │      ╲
+     ╱       │       ╲
+ SIMPLE_   TREND_    POLICY_
+ CHAT      REPORT    INQUIRY
+ 노드      워커(서브)  RAG 워커(서브)
+     ╲       │       ╱
+      ╲      │      ╱
+         ▼   ▼   ▼
            END
 
 [조건부 엣지(conditional edge)란? — 면접 포인트]
@@ -43,7 +44,8 @@ from src.logging_config import get_logger
 from src.schemas import IntentType
 from src.state import AgentState
 
-# 서브 그래프(워커). ④번 덩어리에서 구현한 진짜 트렌드 리포트 그래프를 가져온다.
+# 서브 그래프(워커)들. 메인은 워커의 내부를 모른 채 '하나의 노드'로만 꽂는다.
+from src.sub_graphs.rag_worker import build_rag_worker_graph
 from src.sub_graphs.trend_report import build_trend_report_graph
 
 _logger = get_logger(__name__)
@@ -158,6 +160,8 @@ def route_by_intent(state: AgentState) -> str:
     intent = state.get("intent")
     if intent == IntentType.TREND_REPORT.value:
         return "trend_report"
+    if intent == IntentType.POLICY_INQUIRY.value:
+        return "policy_rag"
     # 분류 실패/누락을 포함한 그 외 모든 경우는 안전하게 단순 답변으로 보낸다.
     # (알 수 없는 의도를 그냥 크래시시키지 않는 방어적 기본값)
     return "simple_chat"
@@ -184,6 +188,7 @@ def build_main_graph(provider: LLMProvider | None = None):
     # 서브 그래프도 '하나의 노드'처럼 꽂힌다. 컴파일된 서브 그래프는 호출 가능한
     # 객체라서, 메인 입장에선 내부를 몰라도 된다. (워커의 캡슐화)
     graph.add_node("trend_report", build_trend_report_graph(provider))
+    graph.add_node("policy_rag", build_rag_worker_graph(provider))
 
     # ── 엣지(흐름) 정의 ──
     # 1) 시작 → 분류
@@ -191,18 +196,21 @@ def build_main_graph(provider: LLMProvider | None = None):
 
     # 2) 분류 → (조건부) → 워커
     #    route_by_intent가 반환한 키를, 아래 매핑으로 실제 노드에 연결한다.
+    #    새 워커 추가 = 노드 등록 1줄 + 여기 매핑 1줄 (헌법의 불변 원칙 1 준수)
     graph.add_conditional_edges(
         "classify_intent",
         route_by_intent,
         {
             "simple_chat": "simple_chat",
             "trend_report": "trend_report",
+            "policy_rag": "policy_rag",
         },
     )
 
     # 3) 각 워커 → 종료
     graph.add_edge("simple_chat", END)
     graph.add_edge("trend_report", END)
+    graph.add_edge("policy_rag", END)
 
     # compile(): 위상이 올바른지 검증하고 실행 가능한 그래프로 만든다.
     return graph.compile()

@@ -61,6 +61,16 @@ async def _run_one(app, label: str, query: str) -> None:
 
     if result.get("intent") == "SIMPLE_CHAT":
         print(f"· 답변(chat_response):\n{result.get('chat_response')}")
+    elif result.get("intent") == "POLICY_INQUIRY":
+        # 규정 RAG 경로의 산출물.
+        print(f"· 검색된 문서 수: {len(result.get('retrieved_docs') or [])}")
+        print(f"· 접지 통과(grounding_passed): {result.get('grounding_passed')}")
+        print(f"· 재시도 횟수(retry_count): {result.get('retry_count')}")
+        if result.get("error"):
+            print(f"· ⚠️ 에러(검색 실패/접지 한도 초과 등): {result['error']}")
+        if result.get("final_output"):
+            print("· 최종 출력(PolicyAnswerOutput, Pydantic 검증 통과):")
+            print(json.dumps(result["final_output"], ensure_ascii=False, indent=2))
     else:
         # TREND_REPORT 경로의 산출물.
         print(f"· 계산된 성장률(코드 연산): {result.get('market_growth_rate')}%")
@@ -79,9 +89,10 @@ async def main() -> None:
     # 기본 공급사(OpenAI)로 컴파일된 메인 앱. 우리 코드 구조와 그대로 싱크.
     app = get_compiled_app()
 
-    # 두 경로를 모두 태워 그래프가 분기마다 올바로 도는지 눈으로 확인.
+    # 세 경로를 모두 태워 그래프가 분기마다 올바로 도는지 눈으로 확인.
     await _run_one(app, "SIMPLE_CHAT 경로", "비밀번호는 어떻게 변경하나요?")
     await _run_one(app, "TREND_REPORT 경로", "올해 SaaS 시장 매출 트렌드를 분석해서 리포트로 만들어줘")
+    await _run_one(app, "POLICY_INQUIRY 경로", "환불 위약금이 몇 퍼센트인지 규정 기준으로 알려주세요")
 
     print("\n✅ E2E 완주. 위 출력에서 탈선/누락이 없는지 직접 검수하세요.")
 

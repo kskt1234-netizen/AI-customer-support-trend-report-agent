@@ -19,8 +19,11 @@ import asyncio
 import pytest
 
 from src.llm.base import LLMProvider
+from src.retrieval.base import RetrievedDoc, Retriever
 from src.schemas import IntentClassification, IntentType
 from src.main_graph import build_main_graph
+from src.sub_graphs.rag_worker import _MAX_RETRIES as _RAG_MAX_RETRIES
+from src.sub_graphs.rag_worker import build_rag_worker_graph
 from src.sub_graphs.trend_report import build_trend_report_graph, _MAX_RETRIES
 
 
@@ -102,6 +105,16 @@ _GOOD_DRAFT = (
 )
 _BAD_DRAFT = "ㅇㅇ 성장률 그런거 잘 모르겠고 대충 씀"
 
+# ── RAG 워커용 고정 시나리오 ──────────────────────────────────
+# 더미 코퍼스의 환불 정책 문서(POL-REFUND-001: 14일 전액 환불, 위약금 10%) 기준.
+_POLICY_QUERY = "환불 위약금 규정 알려줘"
+_GOOD_POLICY_ANSWER = (
+    "환불은 결제일로부터 14일 이내에 요청하시면 전액 가능하며, "
+    "이후에는 위약금 10%가 공제됩니다. (출처: POL-REFUND-001)"
+)
+# 숫자 '30일'은 환불 문서에 없다 — 그럴듯하지만 명백한 환각.
+_HALLUCINATED_ANSWER = "환불은 30일 이내에만 가능합니다. (출처: POL-REFUND-001)"
+
 
 # ─────────────────────────────────────────────────────────────
 # 1) 메인 그래프 라우팅 통합 — 의도에 따라 올바른 워커로 가는가
@@ -121,6 +134,14 @@ class TestMainGraphRouting:
         assert out["intent"] == "TREND_REPORT"
         assert out["final_output"] is not None
         assert out["final_output"]["market_growth_rate"] == 15.4
+
+    def test_policy_route_reaches_rag_worker(self):
+        """POLICY_INQUIRY 의도 → RAG 워커가 돌아 접지된 답변이 나와야 한다."""
+        app = build_main_graph(FakeProvider(IntentType.POLICY_INQUIRY, [_GOOD_POLICY_ANSWER]))
+        out = asyncio.run(app.ainvoke({"user_query": _POLICY_QUERY, "retry_count": 0}))
+        assert out["intent"] == "POLICY_INQUIRY"
+        assert out["final_output"]["grounded"] is True
+        assert "POL-REFUND-001" in out["final_output"]["citations"]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -247,3 +268,72 @@ class TestTrendSubgraphDefense:
         assert out["critic_passed"] is True
         assert out["final_output"]["sources"] == ["시장조사기관 A 2024 연간 리포트"]
         assert out.get("error") is None
+
+
+# ─────────────────────────────────────────────────────────────
+# 5) 규정 RAG 워커 — 접지 검증(환각 방어)·정직한 거절·장애 방어
+# ─────────────────────────────────────────────────────────────
+class TestRAGWorker:
+    def _run(self, chat_script: list[str], query: str = _POLICY_QUERY) -> dict:
+        provider = FakeProvider(IntentType.POLICY_INQUIRY, chat_script)
+        app = build_rag_worker_graph(provider)
+        return asyncio.run(app.ainvoke({"user_query": query, "retry_count": 0}))
+
+    def test_happy_path_grounded_answer(self):
+        """정상: 문서 근거 답변 + 인용 → 접지 통과, grounded=True로 확정."""
+        out = self._run([_GOOD_POLICY_ANSWER])
+        assert out["grounding_passed"] is True
+        assert out["final_output"]["grounded"] is True
+        assert out["final_output"]["citations"] == ["POL-REFUND-001"]
+        assert out.get("error") is None
+
+    def test_hallucination_is_caught_and_corrected(self):
+        """환각 자가 수정: 문서에 없는 '30일' 답변 → 접지 반려 → 재작성 후 합격."""
+        out = self._run([_HALLUCINATED_ANSWER, _GOOD_POLICY_ANSWER])
+        assert out["retry_count"] == 1  # 환각이 정확히 한 번 잡혔다
+        assert out["final_output"]["grounded"] is True
+
+    def test_persistent_hallucination_gives_safe_refusal(self):
+        """환각이 반복되면 → 한도 초과 → 지어낸 답 대신 안전한 거절 답변."""
+        out = self._run([_HALLUCINATED_ANSWER])  # 스크립트 소진 후 같은 답 반복
+        assert out["retry_count"] == _RAG_MAX_RETRIES
+        assert out["final_output"]["grounded"] is False
+        assert out["final_output"]["citations"] == []
+        assert "접지 검증" in out["error"]
+
+    def test_no_evidence_refuses_honestly_without_llm(self):
+        """검색 0건 → LLM을 아예 호출하지 않고 정직하게 거절해야 한다.
+
+        죽은 챗 모델을 꽂았는데도 거절 답변이 정상적으로 나왔다면,
+        LLM이 호출되지 않았음(환각이 생성될 기회 자체가 없었음)이 증명된다.
+        """
+        provider = FakeProvider(IntentType.POLICY_INQUIRY)
+        provider._chat = _RaisingChat()
+        app = build_rag_worker_graph(provider)
+        out = asyncio.run(app.ainvoke({"user_query": "오늘 점심 메뉴 추천해줘", "retry_count": 0}))
+        assert out["final_output"]["grounded"] is False
+        assert "근거를 찾지 못했습니다" in out["final_output"]["answer"]
+        assert out.get("error") is None  # 장애가 아니라 정상적인 '근거 없음'
+
+    def test_retriever_outage_degrades_to_refusal(self):
+        """검색기 장애 → 크래시 대신 error 기록 + 정직한 거절 답변."""
+        class _BoomRetriever(Retriever):
+            async def retrieve(self, query: str, top_k: int = 3) -> list[RetrievedDoc]:
+                raise ConnectionError("vector DB down (simulated)")
+
+        provider = FakeProvider(IntentType.POLICY_INQUIRY)
+        provider._chat = _RaisingChat()  # LLM까지 죽어 있어도 답변은 나와야 한다
+        app = build_rag_worker_graph(provider, retriever=_BoomRetriever())
+        out = asyncio.run(app.ainvoke({"user_query": _POLICY_QUERY, "retry_count": 0}))
+        assert "문서 검색 실패" in out["error"]
+        assert out["final_output"]["grounded"] is False
+
+    def test_llm_outage_gives_safe_refusal(self):
+        """생성 LLM 전면 장애 → 빈 답변 반려 루프 → 한도 도달 → 안전 거절."""
+        provider = FakeProvider(IntentType.POLICY_INQUIRY)
+        provider._chat = _RaisingChat()
+        app = build_rag_worker_graph(provider)
+        out = asyncio.run(app.ainvoke({"user_query": _POLICY_QUERY, "retry_count": 0}))
+        assert out["retry_count"] == _RAG_MAX_RETRIES
+        assert out["final_output"]["grounded"] is False
+        assert out["error"]
