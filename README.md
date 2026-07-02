@@ -3,6 +3,7 @@
 > **한 문장 요약**
 > LangGraph로 구현한 **마스터-워커 에이전트 허브** — 고객 문의를 의도 분류해 라우팅하고,
 > 트렌드 리포트는 **병렬 수집 · 코드 기반 연산 · 자가 수정 루프**로 생성하며,
+> **모든 LLM/외부 API 장애 지점에 명시적 저하 정책**을 두고
 > **골든셋 기반 자동 평가(CI)** 로 분류 성능을 검증한다.
 
 B2B SaaS 고객지원을 가정한 에이전트 오케스트레이션 프로젝트입니다. 단순 토이가 아니라
@@ -31,13 +32,15 @@ flowchart TD
 
     subgraph WORKER["② 트렌드 리포트 워커 (Sub Graph)"]
         direction TB
-        G["parallel_gather<br/>asyncio.gather 병렬 수집"]:::code
-        CG["compute_growth<br/>⚠️ 순수 파이썬 성장률 연산"]:::code
+        G["parallel_gather<br/>asyncio.gather 병렬 수집<br/>(보조 소스 실패 = 부분 저하로 계속)"]:::code
+        CG["compute_growth<br/>⚠️ 순수 파이썬 성장률 연산<br/>(수치 불량 검증 포함)"]:::code
+        RC{"route_after_compute<br/>수집·연산 실패?"}:::branch
         D["draft_report<br/>LLM 초안 작성"]:::llm
-        CR{"critic · 2단 게이트<br/>1단 코드: 숫자·출처 존재?<br/>2단 LLM: 맥락·톤 타당?"}:::branch
+        CR{"critic · 2단 게이트<br/>1단 코드: 숫자·출처 존재?<br/>2단 LLM: 맥락·톤 타당?<br/>(검수기 장애 = fail-closed 반려)"}:::branch
         F["finalize<br/>Pydantic 경계 검증"]:::code
         B["bail_out<br/>무한루프 방어 탈출"]:::guard
-        G --> CG --> D --> CR
+        G --> CG --> RC
+        RC -->|정상| D --> CR
         CR -.->|"불합격 & retry < 3 · 재작성 루프"| D
         CR -->|합격| F
         CR -->|"retry ≥ 3 · 한도 초과"| B
@@ -46,6 +49,7 @@ flowchart TD
     U --> C
     R ==>|TREND_REPORT| G
     S --> E([END]):::io
+    RC -->|"error · LLM 진입 전 조기 탈출"| E
     F --> E
     B --> E
 
@@ -72,6 +76,7 @@ flowchart TD
 **읽는 법:**
 - **굵은 화살표(`==>`)** = 메인 → 워커로 라우팅되는 핵심 경로(TREND_REPORT)
 - **점선 화살표(`-.->`)** = `critic` 불합격 시 `draft_report`로 되돌아가는 **자가 수정 루프**
+- `route_after_compute` = 수집·연산이 실패하면 **LLM 단계에 진입하기 전에** 조기 탈출하는 방어 분기
 - 색이 곧 노드의 성격: 🟦 LLM · 🟩 순수 코드 · 🟧 분기 · 🟥 방어 탈출
 - 핵심 메시지: **수치 연산(`compute_growth`)·검증(`finalize`)은 초록(코드), 생성·검수는 파랑(LLM)** —
   "LLM은 언어, 코드는 연산"이 색으로 분리돼 보인다.
@@ -92,26 +97,59 @@ flowchart TD
 
 ---
 
+## 장애 대응 설계 (Failure Policy)
+
+전제: **"LLM 호출과 외부 API는 실패한다. 예외 상황이 아니라 일상이다."**
+그래서 모든 장애 지점마다 '어떻게 저하(degrade)할지'를 명시적으로 결정했고,
+각 정책은 죽은 공급사(`_DeadProvider`)를 주입하는 테스트로 검증된다.
+
+| 장애 지점 | 정책 | 왜 이 정책인가 |
+|---|---|---|
+| 의도 분류 LLM 실패 | **SIMPLE_CHAT으로 폴백 라우팅** | 라우터의 실패가 허브 전체의 크래시가 되어선 안 된다. 가장 안전한 기본 경로로 보낸다. |
+| 답변(simple_chat) LLM 실패 | **정중한 고정 문구 + `error` 기록** | 고객에게 스택트레이스 대신 사과를. 원인은 error 필드·로그로 추적 가능하게. |
+| 빈 질문 입력 | **LLM 호출 없이 재질문 안내** | 코드로 처리 가능한 입력에 LLM 비용을 쓰지 않는다(상류 컷). |
+| 시장 데이터(필수 입력) 수집 실패 | **LLM 진입 전 조기 탈출(abort)** | 데이터 없이 초안 LLM을 부르면 비용 낭비 + 근거 없는 환각 보고서 위험. 실패는 상류에서 끊는다. |
+| 경쟁사 데이터(보조 입력) 수집 실패 | **부분 저하(degraded)로 계속 진행** | 보조 입력의 실패는 전체 실패가 아니다. 시장 데이터만으로 보고서를 완성한다. |
+| 초안 작성 LLM 실패 | **빈 초안 반환 → 기존 자가 수정 루프가 재시도를 겸함** | 빈 초안은 코드 게이트가 반드시 반려 → 루프가 재호출. 별도 재시도 로직 0줄로 일시 장애 회복, 지속 장애는 `bail_out` 수렴. |
+| 검수(LLM 게이트) 실패·빈 응답 | **fail-closed 반려** | 검수 불가 시 '무검수 통과(fail-open)'는 검증 안 된 보고서를 고객에게 내보내는 것 — 반려가 더 안전하다. |
+| 수집 데이터의 수치 불량(타입·누락) | **크래시 대신 `error` 전환 + 조기 탈출** | 외부 검색 결과는 신뢰하지 않는다. `TypeError` 크래시가 아니라 명시적 실패로. |
+
+이와 별개로 **코드 게이트의 숫자 검사는 정규식 경계 매칭**을 쓴다 — 단순 부분 문자열 검사는
+`"115.4억"` 속의 `15.4`를 오탐하고, `growth=15.0`일 때 자연스러운 표기 `"15%"`를 미탐하기 때문이다.
+
+---
+
+## 관찰가능성 (Observability)
+
+- 전 모듈이 `logging_config.get_logger()` 공용 로거 사용 (`print` 금지).
+- **INFO**: 운영 판단에 필요한 결과 — 분류 결과, 성장률 연산값, Critic 합/반려(+사유), 최종 확정.
+- **DEBUG**: 디버깅 근거 — 분류 reasoning(가장 자주 틀리는 지점이라 일부러 받는 필드), 초안 작성 시점.
+- **WARNING/ERROR**: 모든 저하·탈출 지점 — 폴백 라우팅, 부분 저하, fail-closed 반려, 루프 한도 초과.
+- `LOG_LEVEL=DEBUG` 환경변수 하나로 전환. 운영 기본은 INFO.
+
+---
+
 ## 프로젝트 구조
 
 ```
+CLAUDE.md                 # 프로젝트 헌법 — 불변 원칙·가드레일·AI 협업 규칙 (아래 참고)
 src/
 ├── state.py              # 그래프 공용 상태(TypedDict) — 노드 간 데이터 버스
 ├── schemas.py            # 경계 계약(Pydantic) — IntentClassification, TrendReportOutput
 ├── logging_config.py     # 공용 로거(print 대신 logging, 레벨 제어)
-├── main_graph.py         # 오케스트레이터: 의도 분류 + 조건부 라우팅
+├── main_graph.py         # 오케스트레이터: 의도 분류 + 조건부 라우팅 + 폴백 방어
 ├── llm/                  # ── LLM 공급사 추상화(DIP) ──
-│   ├── base.py           #    LLMProvider(ABC) : 추상 계약
+│   ├── base.py           #    LLMProvider(ABC) : 추상 계약 + content 텍스트 강제 변환
 │   ├── openai_provider.py#    OpenAI 구현체
 │   └── factory.py        #    get_provider() : 주입 단일 지점(레지스트리=OCP)
 └── sub_graphs/
-    └── trend_report.py   # 워커: 병렬수집·연산·초안·2단Critic·루프 방어
+    └── trend_report.py   # 워커: 병렬수집·연산·초안·2단Critic·루프/장애 방어
 
 tests/
 ├── test_cases.json       # 골든셋 10개(키워드는 겹치나 의도는 반대인 함정 포함)
 ├── test_harness.py       # 분류 정확도 채점기(투트랙: mock/real)
-├── test_unit.py          # 단위 14개(연산·게이트·라우터·ABC·팩토리·스키마)
-└── test_integration.py   # 통합 8개(라우팅·서브그래프 4시나리오)
+├── test_unit.py          # 단위 33개(연산·게이트·라우터·ABC·팩토리·스키마·장애 방어)
+└── test_integration.py   # 통합 12개(라우팅·서브그래프·우아한 저하 시나리오)
 
 scripts/
 └── run_e2e.py            # 실제 OpenAI로 전체 그래프 완주 확인(수동, 비용 발생)
@@ -150,11 +188,25 @@ python scripts/run_e2e.py
 
 | 층 | 파일 | 검증 | 특징 |
 |---|---|---|---|
-| 단위 | `test_unit.py` | 부품 하나 격리(연산·게이트·라우터·계약) | 빠름, 실패 시 원인 즉시 식별 |
-| 통합 | `test_integration.py` | 조립된 그래프 흐름(분기·루프·방어) | FakeProvider로 결정론적 검증 |
+| 단위 | `test_unit.py` | 부품 하나 격리(연산·게이트·라우터·계약·장애 방어) | 빠름, 실패 시 원인 즉시 식별 |
+| 통합 | `test_integration.py` | 조립된 그래프 흐름(분기·루프·저하 시나리오) | FakeProvider로 결정론적 검증 |
 | 골든셋/E2E | `test_harness.py`, `scripts/run_e2e.py` | 분류 정확도 / 실제 완주 | 투트랙(mock/real) |
 
-자동 테스트 23개 전부 mock으로 돌아 **CI에서 무료·결정론적**으로 통과합니다.
+자동 테스트 **46개** 전부 mock으로 돌아 **CI에서 무료·결정론적**으로 통과합니다.
+장애 테스트는 실제 장애를 일으키는 대신 **'죽은 공급사'를 주입**하는 방식이라 —
+LLM 추상화(DIP)가 테스트 가능성(testability)으로 직결됨을 보여주는 증거이기도 합니다.
+
+---
+
+## AI 협업 헌법 (`CLAUDE.md`)
+
+이 저장소에는 AI 코딩 어시스턴트와 협업하기 위한 **프로젝트 헌법**이 포함되어 있습니다.
+매 스텝을 지시하는 대본이 아니라, **불변 원칙**(마스터-워커 분리, DIP, "LLM은 언어·코드는 연산",
+경계 Pydantic·내부 TypedDict, 모든 루프에 탈출 장치)과 **검증 가드레일**
+(수정 후 반드시 테스트 자가 실행 → 100% 통과 전 완료 선언 금지, 새 동작에는 새 테스트,
+아키텍처 변경·릴리즈는 인간 승인 필수)을 정의합니다.
+→ "AI에게 절차가 아니라 **판단 기준**을 주면, 세부 구현은 위임해도 품질이 유지된다"는
+운영 방식 자체가 이 포트폴리오의 일부입니다.
 
 ---
 
