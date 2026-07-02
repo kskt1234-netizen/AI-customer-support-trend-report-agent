@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from langgraph.graph import END, START, StateGraph
 
-from src.llm.base import LLMProvider
+from src.llm.base import LLMProvider, content_to_text
 from src.llm.factory import get_provider
 from src.logging_config import get_logger
 from src.schemas import IntentType
@@ -47,6 +47,15 @@ from src.state import AgentState
 from src.sub_graphs.trend_report import build_trend_report_graph
 
 _logger = get_logger(__name__)
+
+# ── 방어용 고정 응답 ──────────────────────────────────────────
+# LLM이 죽어도(네트워크 장애·레이트리밋 등) 유저에게 '무언가'는 돌려줘야 한다.
+# 크래시나 스택트레이스 노출 대신 정중한 고정 문구로 우아하게 저하한다.
+_FALLBACK_ANSWER = (
+    "죄송합니다. 일시적인 시스템 오류로 지금은 답변을 드리기 어렵습니다. "
+    "잠시 후 다시 시도해 주세요."
+)
+_EMPTY_QUERY_ANSWER = "질문이 비어 있습니다. 무엇을 도와드릴까요?"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -66,8 +75,24 @@ def make_classify_intent_node(provider: LLMProvider):
     def classify_intent(state: AgentState) -> dict:
         # 노드는 State를 입력받아, '바꿀 필드만' dict로 반환한다.
         # LangGraph가 이 반환 dict를 기존 State에 병합한다.
-        user_query = state["user_query"]
-        result = provider.classify_intent(user_query)
+        user_query = (state.get("user_query") or "").strip()
+
+        # [엣지 케이스 방어] 빈 질문은 LLM에 물어볼 것도 없다.
+        # 분류 비용을 아끼고, SIMPLE_CHAT 경로에서 재질문 안내로 처리한다.
+        if not user_query:
+            _logger.warning("빈 질문 입력 — LLM 분류 생략, SIMPLE_CHAT으로 방어 라우팅")
+            return {"intent": IntentType.SIMPLE_CHAT.value}
+
+        # [예외 방어] 분류 LLM 호출은 실패할 수 있다(네트워크·레이트리밋·타임아웃).
+        # 라우터의 실패가 전체 허브의 크래시가 되어선 안 되므로, 실패 시 가장
+        # 안전한 기본 경로(SIMPLE_CHAT)로 폴백한다. 원인은 로그로 남긴다.
+        try:
+            result = provider.classify_intent(user_query)
+        except Exception:
+            _logger.exception(
+                "의도 분류 LLM 호출 실패 — SIMPLE_CHAT으로 폴백(graceful degradation)"
+            )
+            return {"intent": IntentType.SIMPLE_CHAT.value}
 
         # [관찰가능성] 분류 결과와 '근거(reasoning)'를 로그로 남긴다.
         # 분류는 가장 자주 틀리는 지점이라, 틀렸을 때 '왜 그렇게 판단했는지'를
@@ -90,15 +115,31 @@ def make_simple_chat_node(provider: LLMProvider):
     """일반 문의에 자유 텍스트로 답하는 노드."""
 
     def simple_chat(state: AgentState) -> dict:
-        chat_model = provider.get_chat_model()
-        response = chat_model.invoke(
-            [
-                ("system", "당신은 친절한 B2B SaaS 고객지원 어시스턴트입니다. 간결히 답하세요."),
-                ("human", state["user_query"]),
-            ]
-        )
-        # LangChain 메시지 객체의 .content가 실제 답변 텍스트.
-        return {"chat_response": response.content}
+        user_query = (state.get("user_query") or "").strip()
+
+        # [엣지 케이스 방어] 빈 질문 — LLM 호출 없이 재질문 안내로 응답.
+        if not user_query:
+            return {"chat_response": _EMPTY_QUERY_ANSWER}
+
+        # [예외 방어] 답변 LLM이 죽어도 유저에겐 정중한 고정 문구를 돌려준다.
+        # error 필드에 원인을 남겨 호출자/로그에서 장애를 추적할 수 있게 한다.
+        try:
+            chat_model = provider.get_chat_model()
+            response = chat_model.invoke(
+                [
+                    ("system", "당신은 친절한 B2B SaaS 고객지원 어시스턴트입니다. 간결히 답하세요."),
+                    ("human", user_query),
+                ]
+            )
+        except Exception as e:
+            _logger.exception("simple_chat LLM 호출 실패 — 고정 폴백 답변으로 저하")
+            return {
+                "chat_response": _FALLBACK_ANSWER,
+                "error": f"simple_chat LLM 호출 실패: {e}",
+            }
+
+        # content는 str이 아닐 수도 있다(콘텐츠 블록 리스트 등) → 경계에서 텍스트로 강제.
+        return {"chat_response": content_to_text(response.content)}
 
     return simple_chat
 

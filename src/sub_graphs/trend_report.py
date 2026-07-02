@@ -15,16 +15,20 @@ trend_report.py — TREND_REPORT 워커(서브 그래프).
     ▼
   parallel_gather (async) ── asyncio.gather(시장검색, 경쟁사검색)
     │                         → raw_search_data, sources
+    │                         (경쟁사 실패=부분 저하로 계속 / 시장 실패=error)
     ▼
   compute_growth (순수 파이썬) ── (올해-작년)/작년*100
-    │                            → market_growth_rate
+    │                            → market_growth_rate (데이터 불량이면 error)
+    ▼
+  ◇ route_after_compute ◇ ── error 있으면 즉시 END (수집/연산 실패 조기 탈출)
+    │ 정상
     ▼
   draft_report (LLM) ◀────────────────────────┐ "다시 써"(피드백 동반)
     │                                          │ retry_count += 1
     ▼                                          │
   critic ── 2단 게이트:                         │
     │        1단 코드: 숫자·출처 '존재'?  ───────┘ (불합격 & retry<3 이면 루프)
-    │        2단 LLM : 맥락·톤 '타당'?
+    │        2단 LLM : 맥락·톤 '타당'? (검수기 자체가 죽으면 fail-closed 반려)
     ▼
   ◇ route_after_critic ◇
     ├─ 합격            → final_output(Pydantic 검증) 담고 END
@@ -34,13 +38,17 @@ trend_report.py — TREND_REPORT 워커(서브 그래프).
 from __future__ import annotations
 
 import asyncio
+import re
 
 from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 
-from src.llm.base import LLMProvider
+from src.llm.base import LLMProvider, content_to_text
+from src.logging_config import get_logger
 from src.schemas import TrendReportOutput
 from src.state import AgentState
+
+_logger = get_logger(__name__)
 
 # 무한 루프 방어: 초안↔검수 핑퐁을 최대 몇 번까지 허용할지.
 # 이 횟수를 넘으면 error를 채우고 그래프를 탈출한다. (API 요금 폭탄/크래시 방지)
@@ -87,23 +95,54 @@ async def parallel_gather(state: AgentState) -> dict:
     벽시계 시간이 준다. (CPU 연산이 아니라 I/O 바운드일 때 효과적)
     더미라도 '이런 구조로 짠다'를 보여주는 게 핵심.
     """
-    query = state["user_query"]
+    query = state.get("user_query", "")
 
     # gather: 두 코루틴을 동시에 스케줄링하고, 둘 다 끝나면 결과를 순서대로 반환.
+    # return_exceptions=True: 한쪽이 실패해도 다른 쪽 결과는 살린다.
+    # (기본값 False면 첫 예외가 그대로 전파되어 성공한 쪽 데이터까지 버려진다)
     market, competitor = await asyncio.gather(
         _search_market_data(query),
         _search_competitor_data(query),
+        return_exceptions=True,
     )
 
+    # [실패 정책 — 소스별로 다르게]
+    # 시장 데이터: 성장률 연산의 '필수 입력'. 실패하면 이 워커는 진행 불가 → error.
+    if isinstance(market, BaseException):
+        _logger.error("시장 데이터 수집 실패 — 워커 진행 불가: %s", market)
+        return {"error": f"시장 데이터 수집 실패: {market}"}
+
+    # 경쟁사 데이터: '보조 입력'. 실패해도 시장 데이터만으로 보고서는 쓸 수 있다
+    # → 경고만 남기고 부분 저하(degraded)로 계속 진행한다.
+    sources: list[str] = []
+    if market.get("source"):
+        sources.append(market["source"])
+
+    trend_note = ""
+    if isinstance(competitor, BaseException):
+        _logger.warning("경쟁사 데이터 수집 실패 — 시장 데이터만으로 부분 진행: %s", competitor)
+    else:
+        trend_note = competitor.get("trend_note", "")
+        if competitor.get("source"):
+            sources.append(competitor["source"])
+
+    _logger.info("병렬 수집 완료: 출처 %d개 확보", len(sources))
     return {
         "raw_search_data": {
-            "last_year_revenue": market["last_year_revenue"],
-            "this_year_revenue": market["this_year_revenue"],
-            "trend_note": competitor["trend_note"],
+            # 수치의 '유효성'(숫자인가, 0인가)은 다음 노드 compute_growth가 검증한다.
+            # 여기는 I/O 실패만 책임진다. (한 노드는 한 가지 실패만 책임 — SRP)
+            "last_year_revenue": market.get("last_year_revenue"),
+            "this_year_revenue": market.get("this_year_revenue"),
+            "trend_note": trend_note,
         },
         # 두 검색이 각자 들고 온 출처를 합친다. 보고서의 '근거'가 된다.
-        "sources": [market["source"], competitor["source"]],
+        "sources": sources,
     }
+
+
+def _is_number(value: object) -> bool:
+    """진짜 숫자인지 검사. bool은 int의 서브클래스라 명시적으로 제외한다."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def compute_growth(state: AgentState) -> dict:
@@ -115,17 +154,45 @@ def compute_growth(state: AgentState) -> dict:
     이 노드가 def(동기)이고 provider를 인자로 받지도 않는다는 사실 자체가,
     '여기엔 LLM이 개입할 여지가 없다'는 설계 의도를 코드로 드러낸다.
     """
-    data = state["raw_search_data"]
-    last = data["last_year_revenue"]
-    this = data["this_year_revenue"]
+    # 앞 노드(수집)가 이미 error를 남겼으면 연산할 것이 없다. 그대로 통과시켜
+    # route_after_compute가 조기 탈출하게 한다. (error를 덮어쓰지 않는 것이 중요)
+    if state.get("error"):
+        return {}
+
+    data = state.get("raw_search_data") or {}
+    last = data.get("last_year_revenue")
+    this = data.get("this_year_revenue")
+
+    # [데이터 유효성 방어] 외부 검색 결과는 신뢰할 수 없다. 숫자가 아니거나
+    # 누락됐으면 크래시(TypeError) 대신 명시적 error로 전환해 조기 탈출시킨다.
+    if not _is_number(last) or not _is_number(this):
+        _logger.error(
+            "성장률 연산 불가 — 매출 수치가 유효하지 않음: last=%r, this=%r", last, this
+        )
+        return {"error": f"성장률 연산 불가: 매출 수치가 유효하지 않습니다 (작년={last!r}, 올해={this!r})"}
 
     # 0으로 나누기 방어: 작년 매출이 0이면 성장률 정의가 불가능.
     if last == 0:
+        _logger.warning("작년 매출이 0 — 성장률 정의 불가, 0.0%%로 방어")
         rate = 0.0
     else:
         rate = round((this - last) / last * 100, 1)  # 성장률(%) 수식
 
+    _logger.info("성장률 연산(코드): %s%% (작년=%s → 올해=%s)", rate, last, this)
     return {"market_growth_rate": rate}
+
+
+# ── 조건부 엣지: 수집/연산 실패 시 조기 탈출하는 순수 함수 ──────────
+def route_after_compute(state: AgentState) -> str:
+    """수집·연산 단계에서 error가 남았으면 LLM 단계로 가지 않고 즉시 탈출한다.
+
+    [왜 필요한가? — 비용·안전 방어]
+    데이터가 없는데 draft_report(LLM)를 호출하면 (1) 돈만 쓰고 (2) 근거 없는
+    보고서(환각)를 쓸 위험이 있다. 실패는 '가능한 한 상류에서' 끊는다.
+    """
+    if state.get("error"):
+        return "abort"
+    return "draft_report"
 
 
 # ═════════════════════════════════════════════════════════════
@@ -144,7 +211,8 @@ def make_draft_report_node(provider: LLMProvider):
 
         growth = state["market_growth_rate"]
         sources = state["sources"]
-        trend_note = state["raw_search_data"]["trend_note"]
+        # 경쟁사 수집이 실패(부분 저하)했으면 trend_note가 빈 문자열일 수 있다.
+        trend_note = state["raw_search_data"].get("trend_note") or "(보조 자료 수집 실패로 정보 없음)"
         feedback = state.get("critic_feedback")  # 첫 작성 땐 없음(None).
 
         # 재작성이면 직전 피드백을 프롬프트에 명시해 같은 실수를 피하게 한다.
@@ -168,13 +236,44 @@ def make_draft_report_node(provider: LLMProvider):
             f"{feedback_block}"
         )
 
-        response = chat.invoke([("system", system), ("human", human)])
-        return {"draft_report": response.content}
+        # [예외 방어] 초안 LLM 호출이 실패하면 '빈 초안'을 반환한다.
+        # 빈 초안은 코드 게이트가 반드시 반려하므로, 기존 자가 수정 루프가
+        # 그대로 '재시도(retry)' 역할을 겸한다. 일시 장애면 다음 바퀴에 회복되고,
+        # 지속 장애면 retry 한도 초과로 bail_out에 수렴한다. (별도 재시도 로직 불필요)
+        try:
+            response = chat.invoke([("system", system), ("human", human)])
+        except Exception:
+            _logger.exception("초안 작성 LLM 호출 실패 — 빈 초안 반환(자가 수정 루프가 재시도)")
+            return {"draft_report": ""}
+
+        _logger.debug("초안 작성 완료 (retry_count=%d)", state.get("retry_count", 0))
+        return {"draft_report": content_to_text(response.content)}
 
     return draft_report
 
 
 # ── 1단: 코드 게이트 (싸고 결정론적) ─────────────────────────────
+def _growth_mentioned(draft: str, growth: float) -> bool:
+    """초안에 성장률 수치가 '독립된 숫자'로 등장하는지 검사한다.
+
+    [왜 단순 부분 문자열(`str(growth) in draft`)이 아닌가? — 엣지 케이스]
+      - 오탐: "115.4억" 안에 "15.4"가 부분 문자열로 들어 있어 엉뚱하게 통과한다.
+      - 미탐: growth=15.0일 때 LLM이 자연스럽게 "15%"라고 쓰면 탈락시킨다.
+    그래서 (1) 정수값이면 "15"/"15.0" 두 표기를 모두 허용하고,
+    (2) 정규식으로 숫자 경계(앞뒤에 다른 숫자·소수점 없음)를 강제한다.
+    """
+    candidates = {str(growth)}
+    if float(growth).is_integer():
+        candidates.add(str(int(growth)))  # 15.0 → "15"도 허용
+
+    for cand in candidates:
+        # (?<![\d.]) : 바로 앞에 숫자/소수점 금지 → "115.4"의 일부 매칭 차단
+        # (?!\.?\d)  : 바로 뒤에 (소수점+)숫자 금지 → "15"가 "15.4"에 매칭되는 것 차단
+        if re.search(rf"(?<![\d.]){re.escape(cand)}(?!\.?\d)", draft):
+            return True
+    return False
+
+
 def _code_gate(state: AgentState) -> tuple[bool, str]:
     """초안에 '숫자 성장률'과 '출처'가 '존재'하는지 코드로 검사.
 
@@ -186,9 +285,8 @@ def _code_gate(state: AgentState) -> tuple[bool, str]:
     draft = state.get("draft_report", "") or ""
     growth = state["market_growth_rate"]
 
-    # (a) 코드가 계산한 성장률 숫자가 본문에 실제로 등장하는가?
-    #     문자열로 변환해 포함 여부를 본다. (예: "15.4"가 본문에 있는지)
-    if str(growth) not in draft:
+    # (a) 코드가 계산한 성장률 숫자가 본문에 '경계가 맞는 독립 숫자'로 등장하는가?
+    if not _growth_mentioned(draft, growth):
         return False, f"보고서에 계산된 성장률 수치({growth})가 보이지 않습니다."
 
     # (b) 출처가 본문에 하나라도 인용되었는가?
@@ -225,8 +323,21 @@ def make_llm_gate(provider: LLMProvider):
             "둘 다 만족하면 정확히 'PASS'만 출력하세요. 하나라도 어기면 "
             "'FAIL: <한 문장 사유>' 형식으로 출력하세요."
         )
-        response = chat.invoke([("system", system), ("human", draft)])
-        verdict = (response.content or "").strip()
+        # [예외 방어 — fail-closed 결정]
+        # 검수기 자체가 죽었을 때 '무검수 통과(fail-open)'는 검증 안 된 보고서를
+        # 고객에게 내보내는 것이므로 더 위험하다. 반려(fail-closed)로 처리하면
+        # 자가 수정 루프가 재시도하고, 지속 장애면 bail_out으로 안전하게 수렴한다.
+        try:
+            response = chat.invoke([("system", system), ("human", draft)])
+        except Exception as e:
+            _logger.exception("LLM 게이트 호출 실패 — fail-closed로 반려")
+            return False, f"검수기 호출 실패로 반려(fail-closed): {e}"
+
+        verdict = content_to_text(response.content).strip()
+
+        # [엣지 케이스] 빈 응답 — PASS로 오인하지 않도록 명시적으로 반려.
+        if not verdict:
+            return False, "검수자가 빈 응답을 반환해 판정 불가(fail-closed)."
 
         if verdict.upper().startswith("PASS"):
             return True, ""
@@ -247,27 +358,32 @@ def make_critic_node(provider: LLMProvider):
     llm_gate = make_llm_gate(provider)
 
     def critic(state: AgentState) -> dict:
+        retry = state.get("retry_count", 0)
+
         # 1단: 코드 게이트
         ok, reason = _code_gate(state)
         if not ok:
             # 불합격 도장(False) + 피드백 + retry 카운터 증가. (LLM 게이트는 건너뜀)
+            _logger.info("Critic 1단(코드 게이트) 반려 (retry %d→%d): %s", retry, retry + 1, reason)
             return {
                 "critic_passed": False,
                 "critic_feedback": f"[형식] {reason}",
-                "retry_count": state.get("retry_count", 0) + 1,
+                "retry_count": retry + 1,
             }
 
         # 2단: LLM 게이트 (1단 통과분만 도달)
         ok, reason = llm_gate(state)
         if not ok:
+            _logger.info("Critic 2단(LLM 게이트) 반려 (retry %d→%d): %s", retry, retry + 1, reason)
             return {
                 "critic_passed": False,
                 "critic_feedback": f"[의미/톤] {reason}",
-                "retry_count": state.get("retry_count", 0) + 1,
+                "retry_count": retry + 1,
             }
 
         # 둘 다 통과 → 합격 도장(True)을 명시적으로 찍는다.
         # (라우터는 이 boolean 플래그만 읽어 합격/불합격을 가린다 — 암묵적 신호 X)
+        _logger.info("Critic 2단 게이트 모두 통과 (retry_count=%d)", retry)
         return {"critic_passed": True, "critic_feedback": ""}
 
     return critic
@@ -287,13 +403,22 @@ def finalize(state: AgentState) -> dict:
             summary=state["draft_report"],
             sources=state["sources"],
         )
+        _logger.info(
+            "최종 산출물 확정: 성장률 %s%%, 출처 %d개", output.market_growth_rate, len(output.sources)
+        )
         return {"final_output": output.model_dump()}
     except ValidationError as e:
+        _logger.error("최종 산출물 계약(Pydantic) 검증 실패: %s", e)
         return {"error": f"최종 산출물 검증 실패: {e}"}
 
 
 def bail_out(state: AgentState) -> dict:
     """[노드] retry 한도를 초과했을 때 에러를 담고 루프를 탈출한다."""
+    _logger.warning(
+        "자가 수정 한도(%d회) 초과 — 루프 탈출. 마지막 피드백: %s",
+        _MAX_RETRIES,
+        state.get("critic_feedback", "(없음)"),
+    )
     return {
         "error": (
             f"자가 수정 {_MAX_RETRIES}회를 초과해 품질 기준을 통과하지 못했습니다. "
@@ -344,7 +469,18 @@ def build_trend_report_graph(provider: LLMProvider):
     # ── 엣지(흐름) ──
     graph.add_edge(START, "parallel_gather")
     graph.add_edge("parallel_gather", "compute_growth")
-    graph.add_edge("compute_growth", "draft_report")
+
+    # 수집/연산 실패(error) 시 LLM 단계를 건너뛰고 조기 탈출한다.
+    # (데이터 없이 LLM을 부르면 비용 낭비 + 환각 보고서 위험 — 상류에서 차단)
+    graph.add_conditional_edges(
+        "compute_growth",
+        route_after_compute,
+        {
+            "draft_report": "draft_report",
+            "abort": END,
+        },
+    )
+
     graph.add_edge("draft_report", "critic")
 
     # critic 이후는 상태에 따라 분기(조건부 엣지).

@@ -56,4 +56,4 @@ class AgentState(TypedDict, total=False):
 
     # ── 최종 산출 / 예외 ─────────────────────────────────────
     final_output: dict  # Pydantic(TrendReportOutput) 검증을 통과한 최종 결과의 dict.
-    error: str  # 루프 한도 초과 등으로 탈출할 때 담는 에러 메시지.
+    error: str  # 저하/탈출 사유. (수집 실패, 수치 불량, LLM 호출 실패, 루프 한도 초과 등)

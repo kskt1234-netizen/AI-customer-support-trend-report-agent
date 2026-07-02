@@ -23,10 +23,35 @@ base.py — LLM 공급사(provider)의 추상 인터페이스(계약).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from src.schemas import IntentClassification
+
+
+def content_to_text(content: Any) -> str:
+    """LangChain 메시지의 content를 안전하게 '순수 텍스트'로 변환한다.
+
+    [왜 필요한가? — LLM 경계의 형태 방어]
+    response.content는 보통 str이지만, 모델/버전에 따라 콘텐츠 블록 리스트
+    ([{"type": "text", "text": "..."}, ...])로 올 수도 있고 None일 수도 있다.
+    각 노드가 이 차이를 개별적으로 처리하면 방어가 누락되기 쉬우므로,
+    LLM 경계 모듈인 여기에서 한 번에 흡수한다. (노드는 항상 str만 받는다)
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                parts.append(str(block.get("text", "")))
+        return "".join(parts)
+    return str(content)
 
 
 class LLMProvider(ABC):
